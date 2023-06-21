@@ -110,6 +110,7 @@ class CascadeMVSNet(nn.Module):
     def forward(self, imgs, proj_matrices, depth_values):
         #print('start')
         #start_time = time.time()
+        depth_values = depth_values.type(torch.float32)
         depth_min = float(depth_values[0, 0].cpu().numpy())
         depth_max = float(depth_values[0, -1].cpu().numpy())
         depth_interval = (depth_max - depth_min) / depth_values.size(1)
@@ -130,6 +131,8 @@ class CascadeMVSNet(nn.Module):
             proj_matrices_stage = proj_matrices["stage{}".format(stage_idx + 1)]
             stage_scale = self.stage_infos["stage{}".format(stage_idx + 1)]["scale"]
 
+
+            
             if depth is not None:
                 if self.grad_method == "detach":
                     cur_depth = depth.detach()
@@ -140,9 +143,10 @@ class CascadeMVSNet(nn.Module):
                                                 align_corners=Align_Corners_Range).squeeze(1)
             else:
                 cur_depth = depth_values
+   
             depth_range_samples = get_depth_range_samples(cur_depth=cur_depth,
                                                         ndepth=self.ndepths[stage_idx],
-                                                        depth_inteval_pixel=self.depth_interals_ratio[stage_idx] * depth_interval,
+                                                        depth_inteval_pixel=self.depth_interals_ratio[stage_idx],
                                                         dtype=img[0].dtype,
                                                         device=img[0].device,
                                                         shape=[img.shape[0], img.shape[2], img.shape[3]],

@@ -13,7 +13,7 @@ from struct import *
 from datasets.data_io import read_pfm, save_pfm
 from plyfile import PlyData, PlyElement
 from PIL import Image
-from gipuma import gipuma_filter
+
 
 from multiprocessing import Pool, Process, Queue
 from multiprocessing.pool import ThreadPool
@@ -24,7 +24,6 @@ import signal
 import pymeshlab
 from scipy import ndimage
 import mediapipe as mp
-import pytorch3d
 import glob
 import numpngw
 import png
@@ -39,7 +38,7 @@ parser = argparse.ArgumentParser(description='Predict depth, filter, and fuse')
 
 
 
-parser.add_argument('--testpath', default="/root/lhs/cascade-stereo/CasMVSNet/MVSSTEREOTH_1",help='testing data dir for some scenes')
+parser.add_argument('--testpath', default="./data/demo_face_sample",help='testing data dir for some scenes')
 
 
 parser.add_argument('--model', default='mvsnet', help='select model')
@@ -60,7 +59,7 @@ parser.add_argument('--local_rank',help='testing data dir for some scenes')
 parser.add_argument('--batch_size', type=int, default=4, help='testing batch size')#7 GPUs can use maximum 18 batches +- 2
 parser.add_argument('--numdepth', type=int, default=192, help='the number of depth values')#192 no significant performance improvement even if increased
 
-parser.add_argument('--loadckpt', default="/root/lhs/cascade-stereo/casmvsnet.ckpt", help='load a specific checkpoint')
+parser.add_argument('--loadckpt', default="../casmvsnet.ckpt", help='load a specific checkpoint')
 
 
 parser.add_argument('--display', action='store_true', help='display depth images and masks')
@@ -68,15 +67,15 @@ parser.add_argument('--display', action='store_true', help='display depth images
 parser.add_argument('--share_cr', action='store_true', help='whether share the cost volume regularization')
 
 parser.add_argument('--ndepths', type=str, default="48,32,8", help='ndepths')#48 32 8 no significant performance improvement even if increased
-parser.add_argument('--depth_inter_r', type=str, default="4,2,1", help='depth_intervals_ratio')
+parser.add_argument('--depth_inter_r', type=str, default="4,8,2", help='depth_intervals_ratio')
 parser.add_argument('--cr_base_chs', type=str, default="8,8,8", help='cost regularization base channels')
 parser.add_argument('--grad_method', type=str, default="detach", choices=["detach", "undetach"], help='grad method')
 
 
-parser.add_argument('--interval_scale', type=float, default=4.0, help='the depth interval scale')
+parser.add_argument('--interval_scale', type=float, default=1.06, help='the depth interval scale')
 parser.add_argument('--num_view', type=int, default=5, help='num of view')#2 is blur, 10 is too much
-parser.add_argument('--max_h', type=int, default=1024, help='testing max h')#864
-parser.add_argument('--max_w', type=int, default=1024, help='testing max w')#1152
+parser.add_argument('--max_h', type=int, default=512, help='testing max h')#864
+parser.add_argument('--max_w', type=int, default=512, help='testing max w')#1152
 
 
 parser.add_argument('--fix_res', action='store_true', help='scene all using same res')
@@ -88,10 +87,10 @@ parser.add_argument('--filter_method', type=str, default='normal', choices=["gip
 #filter
 
 #filter by gimupa
-parser.add_argument('--fusibile_exe_path', type=str, default='../../fusibile/fusibile')
+parser.add_argument('--fusibile_exe_path', type=str, default='start fusibile/Release/fusibile.exe')
 parser.add_argument('--prob_threshold', type=float, default='0.9')
-parser.add_argument('--disp_threshold', type=float, default='1.0')
-parser.add_argument('--num_consistent', type=float, default='4')
+parser.add_argument('--disp_threshold', type=float, default='1.5')
+parser.add_argument('--num_consistent', type=float, default='3')
 
 # parse arguments and check
 args = parser.parse_args()
@@ -577,6 +576,7 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
     cmd = cmd + ' --num_consistent=' + str(num_consistent)
     #print(cmd)
     os.system(cmd)
+    print("wait")
     cmd = "PoissonRecon --in " + scan_folder + "/point_clouds.ply --out " + scan_folder + "/mesh9.ply" + " --depth 9 --threads 10"
     t = time.time()
     os.system(cmd)

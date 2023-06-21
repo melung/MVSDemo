@@ -3,6 +3,7 @@ import numpy as np
 import os, cv2, time
 from PIL import Image
 from datasets.data_io import *
+import mediapipe as mp
 #Inside CasMVSNet datasets
 
 s_h, s_w = 0, 0
@@ -43,7 +44,7 @@ class MVSDataset(Dataset):
             else:
                 interval_scale_dict[scan] = self.interval_scale[scan]
 
-            pair_file = "{}/pair.txt".format(scan)
+            pair_file = "pair.txt"
             # read the pair file
             with open(os.path.join(self.datapath, pair_file)) as f:
                 num_viewpoint = int(f.readline())
@@ -71,7 +72,7 @@ class MVSDataset(Dataset):
         imgs = []
         depth_values = None
         proj_matrices = []
-
+        proj_for_landmarks = []
         for i in range(numview):
             img_filename = os.path.join(self.datapath, '{}/images_post/{:0>8}.jpg'.format(scan, i))
             if not os.path.exists(img_filename):
@@ -79,7 +80,7 @@ class MVSDataset(Dataset):
                 if not os.path.exists(img_filename):
                     img_filename = os.path.join(self.datapath, '{}/images/{:0>8}.png'.format(scan, i))
 
-            proj_mat_filename = os.path.join(self.datapath, '{}/cams/{:0>8}_cam.txt'.format(scan, i))
+            proj_mat_filename = os.path.join(self.datapath, 'cams/{:0>8}_cam.txt'.format(i))
             img = self.read_img(img_filename)
             intrinsics, extrinsics, depth_min, depth_interval = self.read_cam_file(proj_mat_filename, interval_scale=
                                                                                    self.interval_scale[scene_name])
@@ -114,22 +115,115 @@ class MVSDataset(Dataset):
             proj_mat[1, :3, :3] = intrinsics
             proj_matrices.append(proj_mat)
 
+            intrinsics[:2,:] *= 4.0
+            intrinsics_s = np.zeros((4, 4))
+            intrinsics_s[:3,:3] = intrinsics
+            proj_for_landmarks.append(intrinsics_s@extrinsics)
+
+
             if i == 0:  # reference view
                 #print(self.ndepths)
                 ####################### fix this code later 
                 depth_values = np.arange(depth_min, depth_interval * (self.ndepths - 0.5) + depth_min, depth_interval,
                                          dtype=np.float32)
 
+
+
+
         #all
         imgs = np.stack(imgs).transpose([0, 3, 1, 2])
         proj_matrices = np.stack(proj_matrices)
+        proj_for_landmarks = np.stack(proj_for_landmarks)
 
         stage2_pjmats = proj_matrices.copy()
         stage2_pjmats[:, 1, :2, :] = proj_matrices[:, 1, :2, :] * 2
         stage3_pjmats = proj_matrices.copy()
         stage3_pjmats[:, 1, :2, :] = proj_matrices[:, 1, :2, :] * 4
         
+
+        # print(np.shape(proj_matrices))
+        # print(proj_matrices[:,0,:,:])
+        # print(proj_matrices[:,1,:,:])
+        
+
+
+        face_idx = [1,2,3,4,5]
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+                            static_image_mode=True,
+                            max_num_faces=1,
+                            refine_landmarks=True,
+                            min_detection_confidence=0.5) 
+        total_face_landmarks =np.zeros((len(face_idx), 478, 2))  
+        total_projection =np.zeros((len(face_idx), 4,4))                       
+        debug_img = []                  
+        for k, i in enumerate(face_idx):
+            img = imgs[i]
+            proj = proj_for_landmarks[i]
+
+            img = np.clip(np.transpose(img, (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
+            image_height, image_width, _ = img.shape
+            img_landmark = img
+            results = face_mesh.process(img_landmark)
+            img_landmark = cv2.cvtColor(img_landmark, cv2.COLOR_RGB2BGR)
+            if not results.multi_face_landmarks:
+                print("no detected data - ", file)
+                continue
+            face_landmarks = results.multi_face_landmarks[0].landmark
+            lmk_array = np.zeros((len(face_landmarks), 2))
+            #print(len(face_landmarks))
+            for f_idx in range(len(face_landmarks)):
+                lmk_array[f_idx, 0] = face_landmarks[f_idx].x * image_width
+                lmk_array[f_idx, 1] = face_landmarks[f_idx].y * image_height
+                #lmk_array[f_idx, 2] = face_landmarks[f_idx].z
+                landmark_image = cv2.circle(img_landmark,(int(lmk_array[f_idx,0]),int(lmk_array[f_idx,1])),1,(255,255,255),-1)
+            total_face_landmarks[k,:,:] = lmk_array
+            total_projection[k,:,:] = proj
+            # cv2.imshow('A',landmark_image)
+            # cv2.waitKey(0)
+
+
+        N,M,_ = total_face_landmarks.shape
+        X = np.zeros((M,3))
+        for i in range(M):
+            A = np.empty((2*N,4))
+            for j in range(N):
+                A[2*j:2*j+2] = [total_face_landmarks[j,i,0]*total_projection[j,2,:]-total_projection[j,0,:],total_face_landmarks[j,i,1]*total_projection[j,2,:]-total_projection[j,1,:]]
+
+            _,_,V = np.linalg.svd(A)
+            X[i,:] = V[-1,:-1]/V[-1,-1]
+
+        #print(X)
+        N,_,_ = proj_for_landmarks.shape
+        re_depth = np.zeros((N,len(face_landmarks)))
+        re_pos = np.zeros((N,len(face_landmarks),2))
   
+        for i in range(N):
+            for j in range(M):
+                X_cam = np.dot(proj_for_landmarks[i],np.append(X[j],1))
+                re_depth[i,j] = X_cam[2]
+                re_pos[i,j,0] = X_cam[0]/X_cam[2]
+                re_pos[i,j,1] = X_cam[1]/X_cam[2]
+        #print(re_depth)
+        #print(re_pos)
+
+        for i in range(N):
+            img = imgs[i]
+            img = np.clip(np.transpose(img, (1, 2, 0)) * 255, 0, 255).astype(np.uint8)
+            image_height, image_width, _ = img.shape
+            img_landmark = img
+            img_landmark = cv2.cvtColor(img_landmark, cv2.COLOR_RGB2BGR)
+            for f_idx in range(len(face_landmarks)):
+
+                    #lmk_array[f_idx, 2] = face_landmarks[f_idx].z
+                    relandmark_image = cv2.circle(img_landmark,(int(re_pos[i,f_idx,0]),int(re_pos[i,f_idx,1])),1,(0,0,255),-1)
+            cv2.imwrite(os.path.join(self.datapath, '{}/{:0>8}_re_landmark.jpg'.format(scan, i)),relandmark_image)
+
+        re_depth = re_depth.min(axis=1)
+        print(re_depth)
+        depth_values = np.zeros((N,2))
+        depth_values[:,0] = re_depth - 300.0
+        depth_values[:,1] = re_depth + 300.0
+        print(depth_values)
         return {"imgs": imgs,
                 "stage1": proj_matrices,
                 "stage2": stage2_pjmats,
@@ -215,7 +309,7 @@ class MVSDataset(Dataset):
             "stage3": self.datalist["stage3"][view_ids],
         }
         
-        depth_values = self.datalist["depth_values"]
+        depth_values = self.datalist["depth_values"][ref_view]
         
         return {"imgs": imgs,
                 "proj_matrices": proj_matrices_ms,
