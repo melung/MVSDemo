@@ -13,7 +13,9 @@ from struct import *
 from datasets.data_io import read_pfm, save_pfm
 from plyfile import PlyData, PlyElement
 from PIL import Image
-
+from pytorch3d.structures import Pointclouds
+from pytorch3d.vis.plotly_vis import plot_scene
+from pytorch3d.ops.knn import knn_points
 
 from multiprocessing import Pool, Process, Queue
 from multiprocessing.pool import ThreadPool
@@ -32,14 +34,14 @@ cudnn.benchmark = True
 
 #os.environ['CUDA_VISIBLE_DEVICES'] ='0,1'
 
-#device = torch.device("cuda:1")
+device = torch.device("cuda:0")
 
 parser = argparse.ArgumentParser(description='Predict depth, filter, and fuse')
 
 
 
 parser.add_argument('--testpath', default="./data/demo_face_sample",help='testing data dir for some scenes')
-
+#no "/" last
 
 parser.add_argument('--model', default='mvsnet', help='select model')
 
@@ -48,8 +50,12 @@ parser.add_argument('--testpath_single_scene', help='testing data path for singl
 parser.add_argument('--testlist', default="lists/our_list.txt", help='testing scene list')
 parser.add_argument('--landmark', default=True, help='extract landmark')
 parser.add_argument('--faceseg', default=False, help='Face segmentation')
-parser.add_argument('--facealign', default=False, help='Face alignment')
-parser.add_argument('--face_opt', default=False, help='Face optimization')
+parser.add_argument('--facealign', default=True, help='Face alignment')
+parser.add_argument('--facecut', default=True, help='Face cut')
+
+
+parser.add_argument('--face_opt', default=True, help='Face optimization')
+parser.add_argument('--landmarks_projection', default=True, help='Landmark project to mesh')
 
 
 
@@ -87,7 +93,7 @@ parser.add_argument('--filter_method', type=str, default='normal', choices=["gip
 #filter
 
 #filter by gimupa
-parser.add_argument('--fusibile_exe_path', type=str, default='start fusibile/Release/fusibile.exe')
+parser.add_argument('--fusibile_exe_path', type=str, default='C:/Users/MDI_DEMO_PC/Desktop/DEMO/MVS/CasMVSNet/fusibile/Release/fusibile.exe')
 parser.add_argument('--prob_threshold', type=float, default='0.9')
 parser.add_argument('--disp_threshold', type=float, default='1.5')
 parser.add_argument('--num_consistent', type=float, default='3')
@@ -103,7 +109,91 @@ num_stage = len([int(nd) for nd in args.ndepths.split(",") if nd])
 Interval_Scale = args.interval_scale
 
 ##############################################################################################
+def template_opt_init3(n_pos1, n_pos2):
+    n_p1 = n_pos1
+    n_p2 = n_pos2
+    n_p2_result = torch.zeros_like(n_pos2)
 
+    # lmk_valid_center = [6, 197, 195, 5, 4, 1, 19, 94, 2, 20, 242, 141, 370, 462, 250, 245, 122, 351, 465]
+    lmk_valid_center = [6, 197, 195, 5, 4, 1, 19, 94, 2, 20, 242]
+    lmk_valid_up = [67, 109, 10, 338, 297]
+    lmk_valid_right = [162, 127, 234, 93, 132]
+    lmk_valid_left = [389, 356, 454, 323, 361]
+    lmk_valid = lmk_valid_center + lmk_valid_up + lmk_valid_right + lmk_valid_left
+    print(len(lmk_valid))
+
+    R_init = torch.eye(3, device=device, requires_grad=True)
+    T_init = (n_p1[4] - n_pos2[4]).detach().clone()
+    T_init.requires_grad = True
+    S_init = torch.tensor(1.0, device=device, requires_grad=True)
+
+    optimizer_init = torch.optim.Adam([R_init, T_init, S_init], lr=0.01)
+
+    epoch_init = 500
+    print("Optimization Start!")
+    for i in range(epoch_init):
+        optimizer_init.zero_grad()
+        # n_p1_deform = S_init * torch.matmul(R_init, (n_p1 + T_init).t()).t()
+        n_p2_deform = S_init * torch.matmul(R_init, (n_p2 + T_init).t()).t()
+
+        # loss = torch.sum((n_p2 - n_p1_deform) ** 2)
+        loss = torch.sum((n_p1[lmk_valid] - n_p2_deform[lmk_valid]) ** 2)
+        loss.backward()
+        optimizer_init.step()
+        print(i)
+    print("R :",R_init)
+    return R_init
+
+def rotation_matrix_from_direction(direction):
+    # Normalize the direction vector
+    direction = direction / torch.norm(direction)
+    
+    # Define the reference vectors
+    up = torch.tensor([0, 1, 0], dtype=torch.float32)
+    forward = torch.tensor([0, 0, 1], dtype=torch.float32)
+    
+    # Calculate the rotation axis and angle
+    rotation_axis = torch.cross(up, direction)
+    rotation_angle = torch.acos(torch.dot(up, direction))
+    
+    # Create the rotation matrix
+    rotation_matrix = torch.tensor([
+        [torch.cos(rotation_angle) + rotation_axis[0]**2 * (1 - torch.cos(rotation_angle)),
+         rotation_axis[0] * rotation_axis[1] * (1 - torch.cos(rotation_angle)) - rotation_axis[2] * torch.sin(rotation_angle),
+         rotation_axis[0] * rotation_axis[2] * (1 - torch.cos(rotation_angle)) + rotation_axis[1] * torch.sin(rotation_angle)],
+        [rotation_axis[0] * rotation_axis[1] * (1 - torch.cos(rotation_angle)) + rotation_axis[2] * torch.sin(rotation_angle),
+         torch.cos(rotation_angle) + rotation_axis[1]**2 * (1 - torch.cos(rotation_angle)),
+         rotation_axis[1] * rotation_axis[2] * (1 - torch.cos(rotation_angle)) - rotation_axis[0] * torch.sin(rotation_angle)],
+        [rotation_axis[0] * rotation_axis[2] * (1 - torch.cos(rotation_angle)) - rotation_axis[1] * torch.sin(rotation_angle),
+         rotation_axis[1] * rotation_axis[2] * (1 - torch.cos(rotation_angle)) + rotation_axis[0] * torch.sin(rotation_angle),
+         torch.cos(rotation_angle) + rotation_axis[2]**2 * (1 - torch.cos(rotation_angle))]
+    ], dtype=torch.float32)
+    
+    return rotation_matrix
+def calculate_perpendicular_direction(points):
+    # Convert the points to a PyTorch tensor
+    points_tensor = torch.tensor(points, dtype=torch.float32)
+
+    # Calculate the centroid of the points
+    centroid = torch.mean(points_tensor, dim=0)
+    
+    # Compute the covariance matrix
+    centered_points = points_tensor - centroid
+    covariance_matrix = torch.matmul(centered_points.t(), centered_points)
+    
+    # Compute the eigenvalues and eigenvectors of the covariance matrix
+    eigenvalues, eigenvectors = torch.eig(covariance_matrix, eigenvectors=True)
+    
+    # Sort the eigenvalues and eigenvectors in descending order
+    eigenvalues = eigenvalues[:, 0]
+    sorted_indices = torch.argsort(eigenvalues, descending=True)
+    eigenvalues = eigenvalues[sorted_indices]
+    eigenvectors = eigenvectors[:, sorted_indices]
+    
+    # Get the eigenvector corresponding to the smallest eigenvalue
+    perpendicular_direction = eigenvectors[:, -1]
+    
+    return perpendicular_direction
 def write_2d_landmark(landmark_filename, lmk_array, landmark_image):
     np.savez(landmark_filename, lmk=lmk_array)
     cv2.imwrite(landmark_filename[:-3]+'.png', landmark_image)
@@ -544,15 +634,8 @@ def Extract_3d_landmark(lmk_2d_folder, used_view_list):
                 }
             })
             fig.show()
-            #exit()    
-    
-    
-    
-    
-    
-    
+            #exit()
     return lmk_3d
-
 
 
 def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consistent, testpath, scene):
@@ -576,7 +659,7 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
     cmd = cmd + ' --num_consistent=' + str(num_consistent)
     #print(cmd)
     os.system(cmd)
-    print("wait")
+
     cmd = "PoissonRecon --in " + scan_folder + "/point_clouds.ply --out " + scan_folder + "/mesh9.ply" + " --depth 9 --threads 10"
     t = time.time()
     os.system(cmd)
@@ -594,23 +677,135 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
     ms = pymeshlab.MeshSet()
     ms.load_new_mesh(scan_folder + '/mesh8.ply')
     ms.meshing_remove_connected_component_by_diameter(mincomponentdiag = pymeshlab.Percentage(20))
-    ms.meshing_surface_subdivision_loop(iterations = 1, threshold = pymeshlab.Percentage(0))
+    #ms.meshing_surface_subdivision_loop(iterations = 1, threshold = pymeshlab.Percentage(0))
     
-    ms.save_current_mesh(scan_folder + '/filtered_mesh_8_sub.obj')
-    
+    ms.save_current_mesh(scan_folder + '/filtered_mesh_8.obj')
+    if args.facecut:
+        lmk_3d = np.load(os.path.join(point_folder,'lmk_3d.npz'))
+        lmk_3d = lmk_3d['lmk']
+        chin_pos = lmk_3d[152,1]
+
+        ms.compute_selection_by_condition_per_vertex(condselect="y>{}".format(chin_pos+10)) 
+        ms.meshing_remove_selected_vertices()
+        ms.save_current_mesh(scan_folder + '/filtered_mesh_8.obj')
+
+
     
 
     if args.face_opt:
-        thf = Process(target=face_optim, args=(testpath, scene, "filtered_mesh_8_sub.obj"))
+        os.makedirs(testpath + '/optimize',exist_ok=True)
+        thf = Process(target=face_optim, args=(testpath, scene, "filtered_mesh_8.obj"))
         thf.start()    
         
         # thf2 = Process(target=face_optim, args=(testpath, scene, "filtered_mesh_9.obj"))
         # thf2.start() 
+        thf.join()
+        if args.landmarks_projection:
+            v, f, c = obj_read_w_color(os.path.join(scan_folder, 'optimized_mesh_final.obj'))
+
+            v = torch.tensor(v)[None].to(device)
+            f = torch.tensor(f)[None].to(device)
+            c = torch.tensor(c)[None].to(device)
+
+            lmk_3d = np.load(os.path.join(point_folder,'lmk_3d.npz'))
+            lmk_3d = lmk_3d['lmk']
+            lmk_3d_tr = torch.tensor(lmk_3d).float().to(device)
+            knn = knn_points(lmk_3d_tr[None], v.float())
+
+            lmk_idx = knn[1].squeeze(0).squeeze(-1).detach().cpu().numpy()
+            lmk_3d2 = v[0, lmk_idx, :].detach().cpu().numpy()
+
+            np.savez(os.path.join(scan_folder, 'lmk_ref_with_idx.npz'), lmk_idx=lmk_idx, lmk=lmk_3d)
+            if True:
+                lmk_3d = torch.tensor(lmk_3d).to(device)
+                lmk_3d2 = torch.tensor(lmk_3d2).to(device)
+                # print(lmk_3d.shape,lmk_3d2.shape)
+                point_cloud1 = Pointclouds(points=[lmk_3d],
+                                            features=[torch.ones_like(lmk_3d) * torch.tensor([[1, 0, 0]]).to(device)])
+
+                point_cloud2 = Pointclouds(points=v, features=torch.ones_like(v) * torch.tensor([[0, 1, 0]]).to(device))
+                point_cloud3 = Pointclouds(points=[lmk_3d2], features=[torch.ones_like(lmk_3d2) * torch.tensor([[0, 0, 1]]).to(device)])
+                
+                aaa = torch.zeros((2,3)).to(device)
+                aaa[0] = lmk_3d[98,:]
+                aaa[1] = lmk_3d[327,:]
+
+                point_cloude = Pointclouds(points=[aaa],
+                                features=[torch.ones_like(aaa) * torch.tensor([[1, 0, 1]]).to(device)])
+
+                
+                # render both in the same plot in different traces
+                fig = plot_scene({
+                    "Pointcloud": {
+                        "lmk_3d": point_cloud1,
+                            "v": point_cloud2,
+                        "lmk_3d_mapping": point_cloud3,
+                        "98,327": point_cloude
+                    }
+                })
+                fig.show()
         
-    
-    
+    if args.facecut:
+        ms.load_new_mesh(scan_folder + '/optimized_mesh_final.obj')
+        lmk_3d = np.load(os.path.join(point_folder,'lmk_3d.npz'))
+        lmk_3d = lmk_3d['lmk']
+        chin_pos = lmk_3d[152,1]
+        ms.compute_selection_by_condition_per_vertex(condselect="y>{}".format(chin_pos+10)) 
+        ms.meshing_remove_selected_vertices()
+
+        headtop_pos = lmk_3d[10,1]
+        ms.compute_selection_by_condition_per_vertex(condselect="y<{}".format(headtop_pos)) 
+        ms.meshing_remove_selected_vertices()
+
+        left_top_idx = [338,297,332,284,251,389,356]
+        right_top_idx = [109,67,103,54,21,162,127]
+        for i in left_top_idx:
+            pos = lmk_3d[i]
+            ms.compute_selection_by_condition_per_vertex(condselect="x<{} && y<{} &&z<{}".format(pos[0],pos[1],pos[2])) 
+            ms.meshing_remove_selected_vertices()
+        for i in right_top_idx:
+            pos = lmk_3d[i]
+            ms.compute_selection_by_condition_per_vertex(condselect="x>{} && y<{} &&z<{}".format(pos[0],pos[1],pos[2])) 
+            ms.meshing_remove_selected_vertices()
+
+        left_pos = lmk_3d[454]
+        ms.compute_selection_by_condition_per_vertex(condselect="x<{}".format(left_pos[0])) 
+        ms.meshing_remove_selected_vertices()
+
+        right_pos = lmk_3d[234]
+        ms.compute_selection_by_condition_per_vertex(condselect="x>{}".format(right_pos[0])) 
+        ms.meshing_remove_selected_vertices()
+
+        ms.compute_selection_by_condition_per_vertex(condselect="z<{}".format(left_pos[2])) 
+        ms.meshing_remove_selected_vertices()
+        ms.compute_selection_by_condition_per_vertex(condselect="z<{}".format(right_pos[2])) 
+        ms.meshing_remove_selected_vertices()
+
+
+        # left_bot_idx = [323,361,288,397,365,379,378,400,377]
+        # right_bot_idx = [93,132,58,172,136,150,149,176,148]
+        # for i in left_bot_idx:
+        #     pos = lmk_3d[i]
+        #     ms.compute_selection_by_condition_per_vertex(condselect="x<{} && y>{} &&z<{}".format(pos[0],pos[1],pos[2])) 
+        #     ms.meshing_remove_selected_vertices()
+        # for i in right_bot_idx:
+        #     pos = lmk_3d[i]
+        #     ms.compute_selection_by_condition_per_vertex(condselect="x>{} && y>{} &&z<{}".format(pos[0],pos[1],pos[2])) 
+        #     ms.meshing_remove_selected_vertices()
+
+
+
+        
+
+
+        ms.save_current_mesh(scan_folder + '/mp_cut.obj')
     #cmd = "python /root/lhs/face-parsing.PyTorch/test.py -p " + point_folder 
     
+
+
+
+
+
     if args.faceseg:
         cmd = "python /root/lhs/eye_mask/face_mask.py -p " + point_folder 
         os.system(cmd)
@@ -641,12 +836,13 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
     
     if args.facealign:
         lmk_2d_folder = os.path.join(point_folder, '2d_landmark')
-        lmk_3d = Extract_3d_landmark(lmk_2d_folder,[1,2,3,4])
-        
-        
-        vs, fs, cs = obj_read_w_color(scan_folder + '/filtered_mesh.obj')
-        print(np.shape(vs))
-        vertex_mean = np.mean(vs, 0)
+        #lmk_3d = Extract_3d_landmark(lmk_2d_folder,[1,2,3,4])
+        lmk_3d = np.load(os.path.join(point_folder,'lmk_3d.npz'))
+        lmk_3d = lmk_3d['lmk']
+        vs, fs, cs = obj_read_w_color(scan_folder + '/filtered_mesh_8.obj')
+        print(np.shape(lmk_3d))
+        vertex_mean = np.mean(lmk_3d, 0)
+        #vertex_mean = lmk_3d[4,:].copy()
         print(vertex_mean)
         #print(point_folder[:-16]+'/cams/*_cam.txt')
         cam_list = sorted(glob.glob(point_folder[:-16]+'/cams/*_cam.txt'))
@@ -664,28 +860,13 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
         # print(T)   
         # print(K)      
         
-        #R_world = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        theta_x = np.radians(0)
-        theta_y = np.radians(0)
+        R_world = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
 
-        # Create rotation matrices for x and y axes
-        R_x = np.array([[1, 0, 0],
-                        [0, np.cos(theta_x), -np.sin(theta_x)],
-                        [0, np.sin(theta_x), np.cos(theta_x)]])
 
-        R_y = np.array([[np.cos(theta_y), 0, np.sin(theta_y)],
-                        [0, 1, 0],
-                        [-np.sin(theta_y), 0, np.cos(theta_y)]])
-
-        # Compute combined rotation matrix
-        R_world = np.dot(R_x, R_y)
-        
-        
-        
-        r_mesh = torch.matmul(torch.Tensor(vs), torch.Tensor(R_world).T)
+        #r_mesh = torch.matmul(torch.Tensor(vs), torch.Tensor(R_world).T)
         #np.mean(r_mesh.to('cpu').numpy(),0)
-        new_origin = np.mean(r_mesh.numpy(),0).T
-        #new_origin = vertex_mean.T
+        #new_origin = np.mean(r_mesh.numpy(),0).T
+        new_origin = vertex_mean.T
         #new_origin = np.array([0,0,0])
         print(new_origin)
         #new_origin = -np.array([-1100,200,-500]).astype(np.float64)
@@ -696,8 +877,125 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
         T_world_inv = -np.matmul(R_world_inv, np.array([0,0,0])).astype(np.float64)
         T_world_inv2 = -np.matmul(np.identity(3), new_origin).astype(np.float64)
         for i, filename in enumerate(cam_list): 
+            focal = K[i, 0, 0]
+
+            # Define the transformation matrix that maps points from the new world coordinate system to the camera coordinate system
+            M_world_to_cam = np.array([
+                [R[i, 0, 0], R[i, 0, 1], R[i, 0, 2], T[i, 0, 0]],
+                [R[i, 1, 0], R[i, 1, 1], R[i, 1, 2], T[i, 1, 0]],
+                [R[i, 2, 0], R[i, 2, 1], R[i, 2, 2], T[i, 2, 0]],
+                [0, 0, 0, 1]
+            ])
+            M_new_world_to_cam = np.array([
+                [R_world[0, 0], R_world[0, 1], R_world[0, 2], T_world_inv[0]],
+                [R_world[1, 0], R_world[1, 1], R_world[1, 2], T_world_inv[1]],
+                [R_world[2, 0], R_world[2, 1], R_world[2, 2], T_world_inv[2]],
+                [0, 0, 0, 1]
+            ])
+            
+            M_new_cam_to_world = np.linalg.inv(M_new_world_to_cam.astype(np.float64))
+            M_new_world_to_cam = np.matmul(M_world_to_cam, M_new_cam_to_world)
+            # Extract the rotation matrix R_new, translation vector T_new, and intrinsic camera matrix K_new from the new transformation matrix
+            R_new = M_new_world_to_cam[:3,:3]
+            T_new = M_new_world_to_cam[:3, 3:]
             
             
+            M_world_to_cam = np.array([
+                [R_new[0, 0], R_new[0, 1], R_new[0, 2], T_new[0, 0]],
+                [R_new[1, 0], R_new[1, 1], R_new[1, 2], T_new[1, 0]],
+                [R_new[2, 0], R_new[2, 1], R_new[2, 2], T_new[2, 0]],
+                [0, 0, 0, 1]
+            ])
+            M_new_world_to_cam = np.array([
+                [1, 0, 0, T_world_inv2[0]],
+                [0, 1, 0, T_world_inv2[1]],
+                [0, 0, 1, T_world_inv2[2]],
+                [0, 0, 0, 1]
+            ])
+            
+            M_new_cam_to_world = np.linalg.inv(M_new_world_to_cam.astype(np.float64))
+            M_new_world_to_cam = np.matmul(M_world_to_cam, M_new_cam_to_world)
+            # Extract the rotation matrix R_new, translation vector T_new, and intrinsic camera matrix K_new from the new transformation matrix
+            R_new = M_new_world_to_cam[:3, :3]
+            T_new = M_new_world_to_cam[:3, 3:]
+            
+            
+            
+            K_new = K[i,:,:].copy()
+            #K_new[0, 2] = -T_new[0, 0] / T_new[2, 0] * focal + K[i, 0, 2]
+            #K_new[1, 2] = -T_new[1, 0] / T_new[2, 0] * focal + K[i, 1, 2]
+            
+
+            
+
+            cam = np.zeros((2,4,4))
+            cam[0,:3,:3] = R_new
+            cam[1,:3,:3] = K_new
+            cam[0,:3, 3] = T_new.T
+            cam[0, 3, 3] = 1
+            #print(filename[:-17] +"_align")
+            os.makedirs(filename[:-17]+"_align", exist_ok= True)
+            newfile = filename.replace("cams", 'cams_align')
+            f = open(newfile, "w")
+            f.write('extrinsic\n')
+            for i in range(0, 4):
+                for j in range(0, 4):
+                    f.write(str(np.round(cam[0][i][j],7)) + ' ')
+                f.write('\n')
+            f.write('\n')
+
+            f.write('intrinsic\n')
+            for i in range(0, 3):
+                for j in range(0, 3):
+                    f.write(str(cam[1][i][j]) + ' ')
+                f.write('\n')
+
+            f.write('\n' + str(900) + ' ' + str(1.5))
+
+            f.close()
+
+        cam_list = sorted(glob.glob(filename[:-17]+"_align"+'/*_cam.txt'))
+        R = np.zeros((len(cam_list),3,3))
+        T = np.zeros((len(cam_list),3,1))
+        K = np.zeros((len(cam_list),3,3))
+        RTT = np.zeros((len(cam_list),4,4))
+        for i, filename in enumerate(cam_list):
+            Ki, RT = read_camera_parameters(filename)
+            R[i,:,:] = RT[:3,:3]
+            T[i,:,0] = RT[:3,3]
+            K[i,:,:] = Ki[:,:]
+            RTT[i,:,:] = RT[:,:]
+    
+
+
+        # direction_vector = calculate_perpendicular_direction(lmk_3d)
+
+        # print(direction_vector)
+        # rotation_matrix = rotation_matrix_from_direction(direction_vector)
+        nose_idx = [115,220,45,4,275,440,344]
+        mean_nose = np.mean(lmk_3d[nose_idx]-vertex_mean,0)
+
+        transed_3d_lmk = lmk_3d - vertex_mean
+        init_3d_lmk = np.load("C:/Users/MDI_DEMO_PC/Desktop/DEMO/MVS/CasMVSNet/Init_3dlmk.npy")
+        tmpz = init_3d_lmk[:,2].copy()
+        init_3d_lmk[:,2] = -init_3d_lmk[:,1]
+        init_3d_lmk[:,1] = -tmpz 
+        
+        rotation_matrix = template_opt_init3(torch.from_numpy(init_3d_lmk).to(dtype = torch.float,device = device),torch.from_numpy(transed_3d_lmk).to(dtype = torch.float,device = device))
+        R_world = rotation_matrix.detach().cpu().numpy()
+        print(R_world)
+
+        
+        new_origin = np.array([0,0,0])
+        print(new_origin)
+        #new_origin = -np.array([-1100,200,-500]).astype(np.float64)
+        #print(new_origin)
+        
+        
+        R_world_inv = np.linalg.inv(R_world)
+        T_world_inv = -np.matmul(R_world_inv, np.array([0,0,0])).astype(np.float64)
+        T_world_inv2 = -np.matmul(np.identity(3), new_origin).astype(np.float64)
+        for i, filename in enumerate(cam_list): 
             focal = K[i, 0, 0]
 
             # Define the transformation matrix that maps points from the new world coordinate system to the camera coordinate system
@@ -746,19 +1044,22 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
             #K_new[0, 2] = -T_new[0, 0] / T_new[2, 0] * focal + K[i, 0, 2]
             #K_new[1, 2] = -T_new[1, 0] / T_new[2, 0] * focal + K[i, 1, 2]
             
+
+
             cam = np.zeros((2,4,4))
             cam[0,:3,:3] = R_new
             cam[1,:3,:3] = K_new
             cam[0,:3, 3] = T_new.T
             cam[0, 3, 3] = 1
             #print(filename[:-17] +"_align")
-            os.makedirs(filename[:-17]+"_align", exist_ok= True)
-            newfile = filename.replace("cams", 'cams_align')
+            os.makedirs(filename[:-17]+"_align2", exist_ok= True)
+            #print(filename)
+            newfile = filename.replace("cams_align", 'cams_align_align2')
             f = open(newfile, "w")
             f.write('extrinsic\n')
             for i in range(0, 4):
                 for j in range(0, 4):
-                    f.write(str(cam[0][i][j]) + ' ')
+                    f.write(str(np.round(cam[0][i][j],7)) + ' ')
                 f.write('\n')
             f.write('\n')
 
@@ -770,14 +1071,17 @@ def depth_map_fusion(point_folder, fusibile_exe_path, disp_thresh, num_consisten
 
             f.write('\n' + str(900) + ' ' + str(1.5))
 
-            f.close()        
+            f.close()
+
+
+
                 #meshing_remove_connected_component_by_diameter
     
     return
    
 def face_optim(data_path, data_name, meshname):
 
-    cmd = "python /root/lhs/optimization/main_face.py --data_path " + data_path + " --data_name " + data_name + " --obj_filename " + meshname + " --iters 30" 
+    cmd = "python C:/Users/MDI_DEMO_PC/Desktop/DEMO/FaceOptimization/main_face.py --data_path " + data_path + " --data_name " + data_name + " --obj_filename " + meshname + " --iters 10" 
     print(cmd)
     os.system(cmd)
 

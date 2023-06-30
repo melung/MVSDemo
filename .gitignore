@@ -647,3 +647,4 @@ CasMVSNet/models/__pycache__/module.cpython-39.pyc
 CasMVSNet/datasets/__pycache__/__init__.cpython-39.pyc
 CasMVSNet/datasets/__pycache__/data_io.cpython-39.pyc
 CasMVSNet/datasets/__pycache__/mdi_melungl.cpython-39.pyc
+CasMVSNet/data/demo_face_sample/cams_align/00000000_cam.txt

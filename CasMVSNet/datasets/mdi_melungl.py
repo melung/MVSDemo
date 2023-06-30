@@ -193,6 +193,8 @@ class MVSDataset(Dataset):
             X[i,:] = V[-1,:-1]/V[-1,-1]
 
         #print(X)
+        np.savez(os.path.join(self.datapath+'_output', '{}'.format(scan, i), 'lmk_3d.npz'), lmk=X)
+
         N,_,_ = proj_for_landmarks.shape
         re_depth = np.zeros((N,len(face_landmarks)))
         re_pos = np.zeros((N,len(face_landmarks),2))
