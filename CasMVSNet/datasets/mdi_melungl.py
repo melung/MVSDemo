@@ -8,7 +8,7 @@ import mediapipe as mp
 
 s_h, s_w = 0, 0
 class MVSDataset(Dataset):
-    def __init__(self, datapath, listfile, mode, nviews, ndepths=192, interval_scale=1.06, **kwargs):
+    def __init__(self, datapath, front_face_idx, listfile, mode, nviews, ndepths=192, interval_scale=1.06, **kwargs):
         super(MVSDataset, self).__init__()
         self.datapath = datapath
         self.listfile = listfile
@@ -19,7 +19,7 @@ class MVSDataset(Dataset):
         self.max_h, self.max_w = kwargs["max_h"], kwargs["max_w"]
         self.fix_res = kwargs.get("fix_res", False)  #whether to fix the resolution of input image.
         self.fix_wh = False
-
+        self.front_face_idx = front_face_idx
         assert self.mode == "test"
         self.metas = self.build_list()
 
@@ -68,6 +68,8 @@ class MVSDataset(Dataset):
         meta = self.metas[0]
         numview = len(self.metas)
         scan, ref_view, src_views, scene_name = meta
+        os.makedirs(os.path.join(self.datapath+'_output',scan),exist_ok=True)    
+
         # use only the reference view and first nviews-1 source views
         imgs = []
         depth_values = None
@@ -146,8 +148,8 @@ class MVSDataset(Dataset):
         # print(proj_matrices[:,1,:,:])
         
 
-
-        face_idx = [1,2,3,4,5]
+        print('Using Front Camera ',self.front_face_idx)
+        face_idx = self.front_face_idx
         face_mesh = mp.solutions.face_mesh.FaceMesh(
                             static_image_mode=True,
                             max_num_faces=1,
@@ -218,14 +220,14 @@ class MVSDataset(Dataset):
 
                     #lmk_array[f_idx, 2] = face_landmarks[f_idx].z
                     relandmark_image = cv2.circle(img_landmark,(int(re_pos[i,f_idx,0]),int(re_pos[i,f_idx,1])),1,(0,0,255),-1)
-            cv2.imwrite(os.path.join(self.datapath, '{}/{:0>8}_re_landmark.jpg'.format(scan, i)),relandmark_image)
+            os.makedirs(os.path.join(self.datapath+'_output', '{}/lmk_reprojection'.format(scan)),exist_ok=True)
+            cv2.imwrite(os.path.join(self.datapath+'_output', '{}/lmk_reprojection/{:0>8}_re_landmark.jpg'.format(scan, i)),relandmark_image)
 
         re_depth = re_depth.min(axis=1)
-        print(re_depth)
         depth_values = np.zeros((N,2))
         depth_values[:,0] = re_depth - 300.0
         depth_values[:,1] = re_depth + 300.0
-        print(depth_values)
+        #print('Depth Value for each camera',depth_values)
         return {"imgs": imgs,
                 "stage1": proj_matrices,
                 "stage2": stage2_pjmats,
